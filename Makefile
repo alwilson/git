@@ -696,6 +696,7 @@ PROGRAM_OBJS += imap-send.o
 PROGRAM_OBJS += sh-i18n--envsubst.o
 PROGRAM_OBJS += shell.o
 PROGRAM_OBJS += remote-testsvn.o
+PROGRAM_OBJS += split.o
 
 # Binary suffix, set to .exe for Windows builds
 X =
