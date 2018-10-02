@@ -32,28 +32,30 @@
 #include "parse-options.h"
 #include "blob.h"
 
+#include "config.h"
+
 #include "hashmap.h"
 
-struct hashmap revcache;
+static struct hashmap revcache;
 
 struct oid2oid {
 	struct hashmap_entry ent;
-	struct object_id key;
-	struct object_id value;
+	struct object_id rev;
+	struct object_id newrev;
 };
 
-static unsigned int oid_hash(const struct object_id *oid) {
+static unsigned int oidhash(const struct object_id *oid) {
 	return memihash(oid->hash, sizeof(oid->hash));
 }
 
-static int oid_hash_cmp(const void *unused_cmp_data,
-			const void *entry,
-			const void *entry_or_key,
-			const void *unused_keydata)
+static int oidhash_cmp(const void *unused_cmp_data,
+		       const void *entry,
+		       const void *entry_or_key,
+		       const void *unused_keydata)
 {
 	const struct oid2oid *a = entry;
 	const struct oid2oid *b = entry_or_key;
-	return memcmp(&(a->key), &(b->key), sizeof(a->key));
+	return memcmp(&(a->rev), &(b->rev), sizeof(a->rev));
 };
 
 static const char * const split_usage[] = {
@@ -61,50 +63,29 @@ static const char * const split_usage[] = {
 	NULL
 };
 
+static void cache_set(const struct object_id *rev,
+		      const struct object_id *newrev)
+{
+	struct oid2oid *e = xmalloc(sizeof(*e));
+	hashmap_entry_init(e, oidhash(rev));
+	memcpy(&(e->rev),    rev, sizeof(struct object_id));
+	memcpy(&(e->newrev), newrev, sizeof(struct object_id));
 
-struct hash2hash {
-	struct hashmap_entry ent;
-	unsigned char key[GIT_SHA1_RAWSZ];
-	unsigned char newrev[GIT_SHA1_RAWSZ];
-	//struct object_id value;
+	hashmap_add(&revcache, e);
 };
 
-static int hash2hash_cmp(const struct hash2hash *a,
-			 const struct hash2hash *b,
-			 const void *unused)
-{
-	// printf("hash a: %s hash b: %s\n", sha1_to_hex(a->key), sha1_to_hex(b->key));
-	// printf("hashes a and b %s\n", hashcmp(a->key, b->key) ? "don'tmatch" : "match");
-	return hashcmp(a->key, b->key);
-}
+static const void *cache_get(const struct object_id *rev) {
+	struct oid2oid key;
 
-void cache_set(unsigned char *rev, unsigned char* newrev) {
-	struct hash2hash *entry = xmalloc(sizeof(*entry));
-
-	hashcpy(entry->key, rev);
-	hashcpy(entry->newrev, newrev);
-
-	hashmap_entry_init(entry, strhash(rev));
-	hashmap_add(&revcache, entry);
-
-	// printf("hash: 0x%08x\n", entry->ent.hash);
-	// printf("size/table: %i/%i\n", revcache.size, revcache.tablesize);
-
-	return;
-}
-
-const void *cache_get(unsigned char *rev) {
-	struct hash2hash key;
-
-	hashcpy(key.key, rev);
-	hashmap_entry_init(&key, strhash(rev));
+	memcpy(&(key.rev), rev, sizeof(struct object_id));
+	hashmap_entry_init(&key, oidhash(rev));
 
 	// printf("looking up hash: 0x%08x with key %s\n", key.ent.hash, sha1_to_hex(rev));
 
 	return hashmap_get(&revcache, &key, NULL);
 }
 
-void setenv_from_commit(struct commit *commit, unsigned char *env, unsigned char *format) {
+static void setenv_from_commit(struct commit *commit, const char *env, const char *format) {
 	struct pretty_print_context pp = {0};
 	struct strbuf sb = STRBUF_INIT;
 	format_commit_message(commit, format, &sb, &pp);
@@ -113,7 +94,7 @@ void setenv_from_commit(struct commit *commit, unsigned char *env, unsigned char
 	return;
 }
 
-void copy_commit(struct commit *rev, unsigned char *tree, struct commit_list *parents, unsigned char *newrev) {
+static void copy_commit(struct commit *rev, const char *tree, struct commit_list *parents, char *newrev) {
 	struct commit *newrev_commit;
 	struct commit_list *p;
 
@@ -146,8 +127,8 @@ void copy_commit(struct commit *rev, unsigned char *tree, struct commit_list *pa
 	return;
 }
 
-void copy_or_skip(struct commit *rev, unsigned char *tree, struct commit_list *newparents, unsigned char *newrev) {
-	unsigned char *identical = NULL, *nonidentical = NULL;
+static void copy_or_skip(struct commit *rev, const char *tree, struct commit_list *newparents, const char *newrev) {
+	char *identical = NULL, *nonidentical = NULL;
 	struct commit_list *np, *p = NULL, **pptr = &p;
 	struct commit_list *gp, *gotparents = NULL, **gotparentsptr = &gotparents;
 	int copycommit = 0, is_new;
@@ -298,7 +279,7 @@ static void find_existing_splits(void) {
 	return;
 }
 
-void find_subtree_commits(void) {
+static void find_subtree_commits(void) {
 	struct rev_info revs;
 	struct argv_array rev_argv = ARGV_ARRAY_INIT;
 
@@ -324,8 +305,8 @@ void find_subtree_commits(void) {
 	while ((commit = get_revision(&revs))) {
 		printf("Processing commit: %s\n", sha1_to_hex(commit->object.oid.hash));
 
-		const struct hash2hash *exists;
-		exists = cache_get(commit->object.oid.hash);
+		const struct oid2oid *exists;
+		exists = cache_get(commit->object.oid);
 		if (exists != NULL) {
 			printf("  prior: %s\n");
 			continue;
@@ -335,9 +316,9 @@ void find_subtree_commits(void) {
 		struct commit_list *p, *newparents = NULL, **npptr = &newparents;
 		for (p = commit->parents; p; p = p->next) {
 			printf(" %s", sha1_to_hex(p->item->object.oid.hash));
-			exists = cache_get(p->item->object.oid.hash);
+			exists = cache_get(p->item->object.oid);
 			if (exists != NULL) {
-				struct commit *np = lookup_commit_reference(exists->newrev);
+				struct commit *np = lookup_commit_reference(the_repository, exists->newrev);
 				if (np) {
 					npptr = &commit_list_insert(np, npptr)->next;
 				} else {
@@ -351,16 +332,16 @@ void find_subtree_commits(void) {
 		if (p == newparents)
 			printf("\n");
 
-		unsigned char tree_sha1[GIT_SHA1_RAWSZ];
-		unsigned char newrev[GIT_SHA1_RAWSZ];
+		char tree_sha1[GIT_SHA1_RAWSZ];
+		char newrev[GIT_SHA1_RAWSZ];
 		unsigned tree_mode;
-		ret_val = get_tree_entry(commit->tree->object.oid.hash, "contrib/subtree/", tree_sha1, &tree_mode);
+		ret_val = get_tree_entry(commit->maybe_tree->object.oid.hash, "contrib/subtree/", tree_sha1, &tree_mode);
 		printf("  tree is:");
 		if (!ret_val) {
 			printf("  %s\n", sha1_to_hex(tree_sha1));
 			copy_or_skip(commit, tree_sha1, newparents, newrev);
 			// printf("  cacheset: %s -> %s\n", sha1_to_hex(commit->object.oid.hash), sha1_to_hex(newrev));
-			cache_set(commit->object.oid.hash, newrev);
+			// cache_set(commit->object.oid, newrev);
 			printf("  newrev is: %s\n", sha1_to_hex(newrev));
 			// exists = cache_get(commit->object.oid.hash);
 			// if (exists == NULL) {
@@ -414,11 +395,11 @@ int cmd_main(int argc, const char **argv)
 	struct object_id oid;
 	struct object_context obj_context;
 
-	if (get_sha1_with_context(obj_name, 0, oid.hash, &obj_context))
+	if (get_oid_with_context(obj_name, 0, oid.hash, &obj_context))
 		die("Not a valid object name %s", obj_name);
 
-	hashmap_init(&revcache, (hashmap_cmp_fn) hash2hash_cmp, 0);
-	printf("size/table: %i/%i\n", revcache.size, revcache.tablesize);
+	hashmap_init(&revcache, (hashmap_cmp_fn) oidhash_cmp, NULL, 0);
+	printf("size/table: %i/%i\n", hashmap_get_size(&revcache), revcache.tablesize);
 
 	// find_existing_splits();
 
