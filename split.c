@@ -20,7 +20,7 @@
 #include "tag.h"
 #include "object.h"
 #include "commit.h"
-#include "exec_cmd.h"
+#include "exec-cmd.h"
 #include "diff.h"
 #include "revision.h"
 #include "list-objects.h"
@@ -30,15 +30,9 @@
 #include "version.h"
 #include "string-list.h"
 #include "parse-options.h"
-
-#include "config.h"
+#include "blob.h"
 
 #include "hashmap.h"
-
-static unsigned int oid_hash(const struct object_id *);
-static int oid_hash_cmp(const void *, const void *, const void *, const void *);
-static void cache_set(const struct object_id *, const struct object_id *);
-static void find_existing_splits(void);
 
 struct hashmap revcache;
 
@@ -63,32 +57,164 @@ static int oid_hash_cmp(const void *unused_cmp_data,
 };
 
 static const char * const split_usage[] = {
-	N_("git split [<options>] <dir>"),
+	N_("git split [<options>] [<path>...]"),
 	NULL
 };
 
-static void cache_set(const struct object_id *old_rev,
-		     const struct object_id *new_rev)
-{
-	struct oid2oid *e;
-	e = malloc(sizeof(struct oid2oid));
-	hashmap_entry_init(e, oid_hash(old_rev));
-	memcpy(&(e->key),   old_rev, sizeof(struct object_id));
-	memcpy(&(e->value), new_rev, sizeof(struct object_id));
 
-	struct oid2oid *found;
-	found = hashmap_put(&revcache, e);
-	if (found != NULL) {
-		printf("Found a previous cache entry!?\n");
-		// FIXME die here? print out some debug?
-		free(found);
-	}
+struct hash2hash {
+	struct hashmap_entry ent;
+	unsigned char key[GIT_SHA1_RAWSZ];
+	unsigned char newrev[GIT_SHA1_RAWSZ];
+	//struct object_id value;
 };
 
+static int hash2hash_cmp(const struct hash2hash *a,
+			 const struct hash2hash *b,
+			 const void *unused)
+{
+	// printf("hash a: %s hash b: %s\n", sha1_to_hex(a->key), sha1_to_hex(b->key));
+	// printf("hashes a and b %s\n", hashcmp(a->key, b->key) ? "don'tmatch" : "match");
+	return hashcmp(a->key, b->key);
+}
+
+void cache_set(unsigned char *rev, unsigned char* newrev) {
+	struct hash2hash *entry = xmalloc(sizeof(*entry));
+
+	hashcpy(entry->key, rev);
+	hashcpy(entry->newrev, newrev);
+
+	hashmap_entry_init(entry, strhash(rev));
+	hashmap_add(&revcache, entry);
+
+	// printf("hash: 0x%08x\n", entry->ent.hash);
+	// printf("size/table: %i/%i\n", revcache.size, revcache.tablesize);
+
+	return;
+}
+
+const void *cache_get(unsigned char *rev) {
+	struct hash2hash key;
+
+	hashcpy(key.key, rev);
+	hashmap_entry_init(&key, strhash(rev));
+
+	// printf("looking up hash: 0x%08x with key %s\n", key.ent.hash, sha1_to_hex(rev));
+
+	return hashmap_get(&revcache, &key, NULL);
+}
+
+void setenv_from_commit(struct commit *commit, unsigned char *env, unsigned char *format) {
+	struct pretty_print_context pp = {0};
+	struct strbuf sb = STRBUF_INIT;
+	format_commit_message(commit, format, &sb, &pp);
+	setenv(env, sb.buf, 1);
+	// DEBUG printf("%s: %s\n", env, sb.buf);
+	return;
+}
+
+void copy_commit(struct commit *rev, unsigned char *tree, struct commit_list *parents, unsigned char *newrev) {
+	struct commit *newrev_commit;
+	struct commit_list *p;
+
+	printf("copy_commit {%s} {%s} {", sha1_to_hex(rev->object.oid.hash), sha1_to_hex(tree));
+	int more_parents = 0;
+	for (p = parents; p; p = p->next) {
+		printf("%s-p %s", (more_parents)?" ":"", sha1_to_hex(p->item->object.oid.hash));
+		more_parents = 1;
+	}
+	printf("}\n");
+
+	// FIXME - This mimics the bash script version, but we shouldn't have to use env vars
+	setenv_from_commit(rev, "GIT_AUTHOR_NAME",  "%an");
+	setenv_from_commit(rev, "GIT_AUTHOR_EMAIL", "%ae");
+	setenv_from_commit(rev, "GIT_AUTHOR_DATE",  "%aD");
+
+	setenv_from_commit(rev, "GIT_COMMITTER_NAME",  "%cn");
+	setenv_from_commit(rev, "GIT_COMMITTER_EMAIL", "%ce");
+	setenv_from_commit(rev, "GIT_COMMITTER_DATE",  "%cD");
+
+	struct strbuf sb = STRBUF_INIT;
+	struct pretty_print_context pp = {0};
+	format_commit_message(rev, "%B", &sb, &pp);
+	// printf("BODY: \"%s\"\n", sb.buf);
+	const char *msg = sb.buf;
+	const size_t msg_len = strlen(msg);
+
+	int result = commit_tree(msg, msg_len, tree, parents, newrev, NULL, NULL);
+
+	return;
+}
+
+void copy_or_skip(struct commit *rev, unsigned char *tree, struct commit_list *newparents, unsigned char *newrev) {
+	unsigned char *identical = NULL, *nonidentical = NULL;
+	struct commit_list *np, *p = NULL, **pptr = &p;
+	struct commit_list *gp, *gotparents = NULL, **gotparentsptr = &gotparents;
+	int copycommit = 0, is_new;
+
+	for (np = newparents; np; np = np->next) {
+		if (!hashcmp(np->item->maybe_tree->object.oid.hash, tree))
+			identical = np->item->object.oid.hash;
+		else
+			nonidentical = np->item->object.oid.hash;
+
+		// sometimes both old parents map to the same newparent;
+		// eliminate duplicates
+		is_new = 1;
+		for (gp = gotparents; gp; gp = gp->next) {
+			if (!hashcmp(gp->item->object.oid.hash, np->item->object.oid.hash)) {
+				// printf("copy_or_skip - is not new\n");
+				is_new = 0;
+				break;
+			}
+		}
+		if (is_new) {
+			// printf("copy_or_skip - new parent\n");
+			gotparentsptr = &commit_list_insert(np->item, gotparentsptr)->next;
+			pptr          = &commit_list_insert(np->item, pptr)->next;
+		}
+	}
+
+	// printf("copy_or_skip - identical: %s nonidentical: %s\n", (identical)?"yes":"no", (nonidentical)?"yes":"no");
+	if (identical != NULL && nonidentical != NULL) {
+		//extras=$(git rev-list --count $identical..$nonidentical)
+		// struct rev_info revs;
+		// struct argv_array rev_argv = ARGV_ARRAY_INIT;
+
+		// init_revisions(&revs, NULL);
+
+		// /* rev_argv.argv[0] will be ignored by setup_revisions */
+		// argv_array_push(&rev_argv, "find_existing_splits");
+		// argv_array_push(&rev_argv, "f6727b0509ec3417a5183ba6e658143275a734f5..efaf6d46e082bf46320f95eb7a31d03b54825d1d");
+
+		// rev_argv.argc = setup_revisions(rev_argv.argc, rev_argv.argv, &revs, NULL);
+
+		// add_head_to_pending(&revs);
+
+		// int ret_val = prepare_revision_walk(&revs);
+		// if (ret_val < 0)
+		//	die("prepare_revision_walk failed");
+
+		int extras_count = 0;
+		if (extras_count > 0)
+			// we need to preserve history along the other branch
+			copycommit = 1;
+	}
+
+	if (identical != NULL && !copycommit) {
+		// printf("copy_or_skip - skip\n");
+		hashcpy(newrev, identical);
+	} else {
+		// printf("copy_or_skip - copy\n");
+		copy_commit(rev, tree, p, newrev);
+	}
+
+	return;
+}
 
 // FIXME maybe pass stuff in rather than globals?!?!
 static void find_existing_splits(void) {
-	struct rev_info revs;	
+	struct rev_info revs;
 	struct argv_array rev_argv = ARGV_ARRAY_INIT;
 
 	init_revisions(&revs, NULL);
@@ -172,78 +298,19 @@ static void find_existing_splits(void) {
 	return;
 }
 
-int cmd_main(int argc, const char **argv)
-{
-	//const char *dir;
-	//int strict = 0;
-	//struct option options[] = {
-	//	OPT_BOOL(0, "strict", &strict,
-	//		 N_("do not try <directory>/.git/ if <directory> is no Git directory")),
-	//	OPT_END()
-	//};
-
-	//argc = parse_options(argc, argv, NULL, options, split_usage, 0);
-
-	//if (argc != 1)ww//	usage_with_options(split_usage, options);w
-	//setup_path();
-
-	//dir = argv[0];
-
-	//if (!enter_repo(dir, strict))
-	//	die("'%s' does not appear to be a git repository", dir);
-
-	// FIXME This is _not_ a subtree prefix! What is it exactly? Just regular init to find our git config info?
-	const char * prefix;
-	prefix = setup_git_directory();
-	printf("prefix: %s\n", prefix);
-	git_config(git_default_config, NULL);
-
-	// FIXME need cmd line arg here
-	char *obj_name = "HEAD";
-	struct object_id oid;
-	struct object_context obj_context;
-
-	if (get_oid_with_context(obj_name, 0, &oid, &obj_context))
-		die("Not a valid object name %s", obj_name);
-
-	hashmap_init(&revcache, (hashmap_cmp_fn) oid_hash_cmp, NULL, 0);
-	printf("size/table: %i/%i\n", hashmap_get_size(&revcache), revcache.tablesize);
-
-	// JUNK This is just a fun way to see the hashmap in action as it auto-resizes with growth
-	// int i;
-	// for (i = 0; i < 1025; i++) {
-	// 	struct oid2oid *e;
-	// 	e = malloc(sizeof(struct oid2oid));
-	// 	hashmap_entry_init(e, oid_hash(&oid));
-	// 	memcpy(&(e->key), &oid, sizeof(oid));
-	// 	memcpy(&(e->value), &oid, sizeof(oid));
-
-	// 	struct oid2oid *found;
-	// 	found = hashmap_put(&revcache, e);
-	// 	if (found != NULL) {
-	// 		printf("found it!\n");
-	// 		free(found);
-	// 	} else {
-	// 		printf("new entry added\n");
-	// 	}
-
-	// 	printf("size/table: %i/%i\n", hashmap_get_size(&revcache), revcache.tablesize);
-	// }
-
-	//find_existing_splits();
-
+void find_subtree_commits(void) {
 	struct rev_info revs;
 	struct argv_array rev_argv = ARGV_ARRAY_INIT;
 
 	init_revisions(&revs, NULL);
 
-	argv_array_push(&rev_argv, "cmd_main");
+	/* rev_argv.argv[0] will be ignored by setup_revisions */
+	argv_array_push(&rev_argv, "find_existing_splits");
 	argv_array_push(&rev_argv, "--topo-order");
 	argv_array_push(&rev_argv, "--reverse");
-	argv_array_push(&rev_argv, "--parents");
-	argv_array_push(&rev_argv, "HEAD");
+	//argv_array_push(&rev_argv, "f6727b0509ec3417a5183ba6e658143275a734f5..efaf6d46e082bf46320f95eb7a31d03b54825d1d");
 
-	setup_revisions(rev_argv.argc, rev_argv.argv, &revs, NULL);
+	rev_argv.argc = setup_revisions(rev_argv.argc, rev_argv.argv, &revs, NULL);
 
 	add_head_to_pending(&revs);
 
@@ -251,16 +318,111 @@ int cmd_main(int argc, const char **argv)
 	if (ret_val < 0)
 		die("prepare_revision_walk failed");
 
-	struct pretty_print_context ctx = {0};
-	ctx.fmt = CMIT_FMT_USERFORMAT;
-	ctx.date_mode.type = DATE_NORMAL;
-
 	struct commit *commit;
 	int num_revs = 0;
+	// int num_commits = 3;
 	while ((commit = get_revision(&revs))) {
+		printf("Processing commit: %s\n", sha1_to_hex(commit->object.oid.hash));
+
+		const struct hash2hash *exists;
+		exists = cache_get(commit->object.oid.hash);
+		if (exists != NULL) {
+			printf("  prior: %s\n");
+			continue;
+		}
+
+		printf("  parents:");
+		struct commit_list *p, *newparents = NULL, **npptr = &newparents;
+		for (p = commit->parents; p; p = p->next) {
+			printf(" %s", sha1_to_hex(p->item->object.oid.hash));
+			exists = cache_get(p->item->object.oid.hash);
+			if (exists != NULL) {
+				struct commit *np = lookup_commit_reference(exists->newrev);
+				if (np) {
+					npptr = &commit_list_insert(np, npptr)->next;
+				} else {
+					die("attempted to look up %s, but commit didn't exist?", sha1_to_hex(exists->newrev));
+				}
+			}
+		}
+		printf("\n  newparents: ");
+		for (p = newparents; p; p = p->next)
+			printf("%s\n", sha1_to_hex(p->item->object.oid.hash));
+		if (p == newparents)
+			printf("\n");
+
+		unsigned char tree_sha1[GIT_SHA1_RAWSZ];
+		unsigned char newrev[GIT_SHA1_RAWSZ];
+		unsigned tree_mode;
+		ret_val = get_tree_entry(commit->tree->object.oid.hash, "contrib/subtree/", tree_sha1, &tree_mode);
+		printf("  tree is:");
+		if (!ret_val) {
+			printf("  %s\n", sha1_to_hex(tree_sha1));
+			copy_or_skip(commit, tree_sha1, newparents, newrev);
+			// printf("  cacheset: %s -> %s\n", sha1_to_hex(commit->object.oid.hash), sha1_to_hex(newrev));
+			cache_set(commit->object.oid.hash, newrev);
+			printf("  newrev is: %s\n", sha1_to_hex(newrev));
+			// exists = cache_get(commit->object.oid.hash);
+			// if (exists == NULL) {
+			// 	printf("  failed to find newrev in cache!\n");
+			// 	die("dying\n");
+			// } else {
+			// 	printf("  newrev recovered: %s\n", sha1_to_hex(exists->newrev));
+			// }
+			// num_commits--;
+			// if (num_commits == 0)
+			// 	goto early_fail;
+		} else {
+			printf("\n  notree\n");
+			// TODO some notree cache magic? check newparents?
+		}
+
 		num_revs++;
 	}
+early_fail:
 	printf("%i revisions\n", num_revs);
+
+	return;
+}
+
+int cmd_main(int argc, const char **argv)
+{
+	int strict = 0;
+	struct option options[] = {
+		OPT_BOOL(0, "strict", &strict,
+			 N_("do not try <directory>/.git/ if <directory> is no Git directory")),
+		OPT_END()
+	};
+
+	//const char *dir;
+	//setup_path();
+	//dir = argv[0];
+	// if (!enter_repo(dir, strict))
+	// 	die("'%s' does not appear to be a git repository", dir);
+
+	const char * prefix;
+	prefix = setup_git_directory();
+	printf("prefix: %s\n", prefix);
+	git_config(git_default_config, NULL);
+
+	argc = parse_options(argc, argv, prefix, options, split_usage, 0);
+	if (argc < 1)
+		usage_with_options(split_usage, options);
+
+	// char *obj_name = "HEAD";
+	char *obj_name = "efaf6d46e082bf46320f95eb7a31d03b54825d1d";
+	struct object_id oid;
+	struct object_context obj_context;
+
+	if (get_sha1_with_context(obj_name, 0, oid.hash, &obj_context))
+		die("Not a valid object name %s", obj_name);
+
+	hashmap_init(&revcache, (hashmap_cmp_fn) hash2hash_cmp, 0);
+	printf("size/table: %i/%i\n", revcache.size, revcache.tablesize);
+
+	// find_existing_splits();
+
+	find_subtree_commits();
 
 	return 0;
 }
