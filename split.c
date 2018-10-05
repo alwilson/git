@@ -68,7 +68,7 @@ static void cache_set(const struct object_id *rev,
 {
 	struct oid2oid *e = xmalloc(sizeof(*e));
 	hashmap_entry_init(e, oidhash(rev));
-	memcpy(&(e->rev),    rev, sizeof(struct object_id));
+	memcpy(&(e->rev),    rev,    sizeof(struct object_id));
 	memcpy(&(e->newrev), newrev, sizeof(struct object_id));
 
 	hashmap_add(&revcache, e);
@@ -77,10 +77,10 @@ static void cache_set(const struct object_id *rev,
 static const void *cache_get(const struct object_id *rev) {
 	struct oid2oid key;
 
-	memcpy(&(key.rev), rev, sizeof(struct object_id));
 	hashmap_entry_init(&key, oidhash(rev));
+	memcpy(&(key.rev), rev, sizeof(struct object_id));
 
-	// printf("looking up hash: 0x%08x with key %s\n", key.ent.hash, sha1_to_hex(rev));
+	//printf("looking up hash: 0x%08x with key %s\n", key.ent.hash, oid_to_hex(rev));
 
 	return hashmap_get(&revcache, &key, NULL);
 }
@@ -98,10 +98,10 @@ static void copy_commit(struct commit *rev, const char *tree, struct commit_list
 	struct commit *newrev_commit;
 	struct commit_list *p;
 
-	printf("copy_commit {%s} {%s} {", sha1_to_hex(rev->object.oid.hash), sha1_to_hex(tree));
+	printf("copy_commit {%s} {%s} {", oid_to_hex(&rev->object.oid), sha1_to_hex(tree));
 	int more_parents = 0;
 	for (p = parents; p; p = p->next) {
-		printf("%s-p %s", (more_parents)?" ":"", sha1_to_hex(p->item->object.oid.hash));
+		printf("%s-p %s", (more_parents)?" ":"", oid_to_hex(&p->item->object.oid));
 		more_parents = 1;
 	}
 	printf("}\n");
@@ -303,10 +303,10 @@ static void find_subtree_commits(void) {
 	int num_revs = 0;
 	// int num_commits = 3;
 	while ((commit = get_revision(&revs))) {
-		printf("Processing commit: %s\n", sha1_to_hex(commit->object.oid.hash));
+		printf("Processing commit: %s\n", oid_to_hex(&commit->object.oid));
 
 		const struct oid2oid *exists;
-		exists = cache_get(commit->object.oid);
+		exists = cache_get(&(commit->object.oid));
 		if (exists != NULL) {
 			printf("  prior: %s\n");
 			continue;
@@ -315,20 +315,20 @@ static void find_subtree_commits(void) {
 		printf("  parents:");
 		struct commit_list *p, *newparents = NULL, **npptr = &newparents;
 		for (p = commit->parents; p; p = p->next) {
-			printf(" %s", sha1_to_hex(p->item->object.oid.hash));
-			exists = cache_get(p->item->object.oid);
+			printf(" %s", oid_to_hex(&p->item->object.oid));
+			exists = cache_get(&(p->item->object.oid));
 			if (exists != NULL) {
-				struct commit *np = lookup_commit_reference(the_repository, exists->newrev);
+				struct commit *np = lookup_commit_reference(the_repository, &(exists->newrev));
 				if (np) {
 					npptr = &commit_list_insert(np, npptr)->next;
 				} else {
-					die("attempted to look up %s, but commit didn't exist?", sha1_to_hex(exists->newrev));
+					die("attempted to look up %s, but commit didn't exist?", oid_to_hex(&exists->newrev));
 				}
 			}
 		}
 		printf("\n  newparents: ");
 		for (p = newparents; p; p = p->next)
-			printf("%s\n", sha1_to_hex(p->item->object.oid.hash));
+			printf("%s\n", oid_to_hex(&p->item->object.oid));
 		if (p == newparents)
 			printf("\n");
 
@@ -341,9 +341,11 @@ static void find_subtree_commits(void) {
 			printf("  %s\n", sha1_to_hex(tree_sha1));
 			copy_or_skip(commit, tree_sha1, newparents, newrev);
 			// printf("  cacheset: %s -> %s\n", sha1_to_hex(commit->object.oid.hash), sha1_to_hex(newrev));
-			// cache_set(commit->object.oid, newrev);
+			struct object_id newrev_oid;
+			hashcpy(&newrev_oid.hash, newrev);
+			cache_set(&commit->object.oid, &newrev_oid);
 			printf("  newrev is: %s\n", sha1_to_hex(newrev));
-			// exists = cache_get(commit->object.oid.hash);
+			// exists = cache_get(&(commit->object.oid));
 			// if (exists == NULL) {
 			// 	printf("  failed to find newrev in cache!\n");
 			// 	die("dying\n");
